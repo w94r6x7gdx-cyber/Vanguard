@@ -1,4 +1,4 @@
-# Vanguard Documentation
+# Vanguard Technical Documentation
 > Research documentation of Riot Games' Vanguard anti-cheat system (vgc.exe / vgk.sys)
 
 ---
@@ -58,17 +58,19 @@ vgc collects the following data to construct `machine_id` and HWID:
 
 ## Protobuf Schema
 
+### AuthenticationRequest
+
 Gateway payload is an encrypted protobuf with the following fields:
 
 ```proto
 F1  = machine_id
-F2  = PlatformInfo { platform=1, arch=2, os_version }
+F2  = PlatformInfo / Sub2 { A=1, B=2, version="10.0.19045" }
 F4  = game_token (JWT)
-F5  = VGW_CLIENT_PUBKEY
-F6  = vg version
-F7  = vgk version
-F8  = game_id
-F9  = boot_state
+F5  = VGW_CLIENT_PUBKEY (RSA-2048 SPKI base64)
+F6  = vg_version { A=major, B=minor, C=patch, D=build }
+F7  = vgk_version { A=major, B=minor, C=patch, D=build }
+F8  = game_id (string)
+F9  = boot_state (int, value: 3)
 F10 = ephemeral_id (optional, only send if already cached)
 F11 = core_info { CPU, GPU, OS }
 F13 = external_sid (PUUID)
@@ -79,22 +81,83 @@ F15 = { ht: value } base64_sha1 derived from machine_id
 > **F10** is a temporary crypto identity per session — P-256 ECDH-derived keys + nonce. Only send if already cached.
 > **F15 (ht)** is a hash token — base64-encoded SHA1 derived from machine_id. Server recomputes and verifies the pair on every request.
 
+### vg_version Fields
+
+```
+A = major
+B = minor
+C = patch
+D = build
+```
+
+Current known version: `1.18.3.77`
+
+### Sub2 / PlatformInfo Fields
+
+```
+A = 1        (platform)
+B = 2        (arch)
+version      (OS version string e.g. "10.0.19045")
+```
+
+### AuthenticationResponse Fields
+
+```
+getServerRsaPublicKey()   ← live server pubkey for subsequent seals
+getToken()                ← session token used in AccessRequest
+```
+
+### AccessRequest Fields
+
+```
+token   ← token from AuthenticationResponse
+```
+
+### Game IDs
+
+```
+com.riotgames.valorant
+com.riotgames.league
+```
+
 ---
 
 ## Envelope Format
 
+### Outer Wrapper
+
 ```
-Magic:      RG\x01\x00
-Encryption: AES-256-GCM
-Key-Wrap:   RSA-OAEP SHA-512
-AAD:        Message Type Byte
+08 <type_byte> 12 <varint(payload_len)> <rito_payload>
 ```
 
-| Type | Description |
-|---|---|
-| `3` | AuthRequest (client → server) |
-| `4` | ServerResponse (server → client) |
-| `5` | ServerPubKey delivery (server → client) |
+### Rito Payload Layout
+
+```
+52 47 01 00       ← RG\x01\x00 magic (4 bytes)
+<256 bytes>       ← RSA-OAEP SHA-512 wrapped AES-256 key
+<12 bytes>        ← AES-GCM IV
+<N bytes>         ← AES-256-GCM encrypted protobuf
+<16 bytes>        ← GCM authentication tag
+```
+
+### Message Type Bytes
+
+| Byte | Message | Direction |
+|---|---|---|
+| `\x03` | AuthRequest | client → server |
+| `\x04` | AccessRequest | client → server |
+| `\x05` | ServerPubKey delivery | server → client |
+| `\x07` | Heartbeat | client → server |
+
+### Response Payload Layout (server → client)
+
+```
+<9 byte header>
+<256 bytes>    ← RSA-OAEP encrypted AES key (decrypt with client RSA private key)
+<12 bytes>     ← AES-GCM IV
+<N bytes>      ← AES-256-GCM ciphertext
+<16 bytes>     ← GCM tag
+```
 
 ---
 
@@ -119,6 +182,14 @@ All 6 known subdomains:
 | `eu.vg.ac.pvp.net` | `172.64.146.88`, `104.18.41.168` |
 | `logs.vg.ac.pvp.net` | `18.66.192.47`, `18.66.192.16`, `18.66.192.8`, `18.66.192.125` |
 | `telemetry.vg.ac.pvp.net` | `108.138.36.9` |
+
+### Request Format
+
+```
+POST https://{region}.vg.ac.pvp.net:8443/vanguard/v1/gateway
+Content-Type: application/x-protobuf
+Body: <raw binary envelope>
+```
 
 ---
 
@@ -154,19 +225,24 @@ vgc.exe starts
         │
         ▼
 ~8.0s  na.vg.ac.pvp.net:8443 ──────────── telemetry.vg.ac.pvp.net:443
-       Sealed auth check                   Parallel telemetry stream
+       Sealed AuthRequest (\x03)           Parallel telemetry stream
        Fields: F1-F15
        Client → 7 bytes
        Server → 24 bytes
        Immediate FIN both sides
         │
         ▼
+       AccessRequest (\x04)
+       Token from AuthenticationResponse
+        │
+        ▼
    [Session active]
+   Modules + Tasks processing via vgk IOCTL
         │
         ▼
 ~57s   eu.vg.ac.pvp.net:8443
-       Heartbeat re-auth
-       Identical protobuf format
+       Heartbeat (\x07)
+       Identical envelope format
        Region switch NA → EU
 ```
 
@@ -175,10 +251,24 @@ vgc.exe starts
 ## Gateway Oracle
 
 ```
-HTTP 400  →  wrong key / bad payload layout / bad decrypt
+HTTP 400  →  wrong key / bad payload layout / bad decrypt / wrong Content-Type
 HTTP 401  →  key decrypts correctly → auth failure (wrong account / ban)
 HTTP 2xx  →  success
 ```
+
+---
+
+## Session Lifecycle
+
+A valid gateway session alone is **not sufficient** to maintain a live session. The full session lifecycle requires:
+
+1. **AuthRequest** (`\x03`) — initial sealed protobuf with machine fingerprint
+2. **AuthenticationResponse** — server delivers session token + server RSA pubkey
+3. **AccessRequest** (`\x04`) — sealed with server pubkey, contains session token
+4. **Modules + Tasks** — randomized module data delivered via vgk IOCTL responses, must be processed correctly to keep session alive
+5. **Heartbeat** (`\x07`) — periodic sealed keepalive, same envelope format as AccessRequest
+
+Without correct module and task handling from vgk IOCTL the session will drop regardless of a valid init sequence.
 
 ---
 
@@ -202,6 +292,7 @@ From the IAT:
 - vgk IOCTL responses can be intercepted via hypervisor hook on `NtDeviceIoControlFile`
 - IRP hooks via Drivermon as an alternative
 - Kernel callbacks registered by vgk after startup — RWX pages must be allocated **before** this point
+- A decryption key exists inside `vgk.sys` that decrypts IOCTL data passed through the driver
 
 **Process suspend/resume IOCTL codes (from vgk):**
 ```
@@ -274,7 +365,8 @@ Response:  04 00 00 00 28 ...
 
 - `mod.vg.ac.pvp.net` — likely ban/enforcement lookup endpoint, hardened beyond the standard gateway
 - `qa.vg.ac.pvp.net` — staging endpoint, inactive in normal client builds or restricted to Riot internal IPs
-- The live server RSA public key (Pack A) is **not static** — delivered in type5 after session handshake, all static/embedded keys return HTTP 400
+- The live server RSA public key (Pack A) is **not static** — delivered in `AuthenticationResponse`, all static/embedded keys return HTTP 400
 - vgc uses a **statically linked HTTP implementation** over raw Winsock — no `curl.dll` or `winhttp.dll` in PEB
-- Pipe emulation was viable in early iterations of Vanguard but has since been addressed — current research focus is on the gateway crypto layer
-```
+- Pipe emulation was viable in early iterations of Vanguard but has since been addressed — current research focus is on the gateway crypto layer and IOCTL module/task handling
+- Init session alone does not keep a session alive — module and task processing from vgk IOCTL is required
+````
