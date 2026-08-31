@@ -1,4 +1,4 @@
-# Vanguard Technical Documentation
+# Vanguard Documentation
 > Research documentation of Riot Games' Vanguard anti-cheat system (vgc.exe / vgk.sys)
 
 ---
@@ -203,6 +203,12 @@ From the IAT:
 - IRP hooks via Drivermon as an alternative
 - Kernel callbacks registered by vgk after startup — RWX pages must be allocated **before** this point
 
+**Process suspend/resume IOCTL codes (from vgk):**
+```
+suspendio: CTL_CODE(FILE_DEVICE_UNKNOWN, 0xBA6B4A3, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
+resumeio:  CTL_CODE(FILE_DEVICE_UNKNOWN, 0xBA6B4B5, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
+```
+
 ---
 
 ## Session & Token Management
@@ -216,10 +222,59 @@ From the IAT:
 
 ---
 
+## Pipe Communication (Legacy — Patched)
+
+> **Status: Patched.** Pipe emulation via `WriteFile` / `ReadFile` hooks is no longer effective as of early 2026. Documented here for historical reference and internal communication research only.
+
+### Named Pipe Device
+
+```
+\\.\{7C3D5F2A-91B4-44A7-8F1E-13A697D42C8}
+```
+
+vgc communicates with the Valorant game process over a named pipe. The pipe is tracked via `WriteFile`, `ReadFile`, and `PeekNamedPipe` hooks injected into the Valorant process.
+
+### Packet Signatures
+
+Pipe identification signatures written by vgc on init:
+
+```
+Signature 1:  65 00 00 00 56 00 00 00 04
+Signature 2:  03 00 00 00 28 00 00 00 01
+```
+
+### Packet Types
+
+| Packet | Bytes | Size | Description |
+|---|---|---|---|
+| Heartbeat | `03 00 00 00 28 ...` | 40 bytes | Periodic liveness check |
+| Check | `67 00 00 00 44 ...` | variable | Integrity check packet |
+| Drop filter | `02 ?? ?? ?? 24 ...` | variable | Silently dropped on real read |
+
+### Heartbeat Response
+
+vgc sends a 40-byte heartbeat, expects a 40-byte response with the first byte flipped:
+
+```
+Request:   03 00 00 00 28 ...
+Response:  04 00 00 00 28 ...
+```
+
+### PeekNamedPipe Behavior
+
+| fakedResponse[0] | lpTotalBytesAvail | Description |
+|---|---|---|
+| `0x04` | `0` | Response already consumed |
+| `0x03` | `40` | Heartbeat response pending |
+| other | `0` | Nothing available |
+
+---
+
 ## Notes
 
 - `mod.vg.ac.pvp.net` — likely ban/enforcement lookup endpoint, hardened beyond the standard gateway
 - `qa.vg.ac.pvp.net` — staging endpoint, inactive in normal client builds or restricted to Riot internal IPs
 - The live server RSA public key (Pack A) is **not static** — delivered in type5 after session handshake, all static/embedded keys return HTTP 400
 - vgc uses a **statically linked HTTP implementation** over raw Winsock — no `curl.dll` or `winhttp.dll` in PEB
+- Pipe emulation was viable in early iterations of Vanguard but has since been addressed — current research focus is on the gateway crypto layer
 ```
