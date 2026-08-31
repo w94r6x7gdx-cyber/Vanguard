@@ -68,7 +68,7 @@ na.vg.ac.pvp.net	8443	Cloudflare	Active
 eu.vg.ac.pvp.net	8443	Cloudflare	Active
 telemetry.vg.ac.pvp.net	443	AWS CloudFront	Active
 mod.vg.ac.pvp.net	443	—	Denied without client cert
-qa.vg.ac.pvp.net	—	—	Inactive / IP-restricted
+qa.vg.ac.pvp.net	—	Cloudflare	Active
 
 Resolved IPs (as of August 2026):
 
